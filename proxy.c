@@ -17,13 +17,34 @@ struct uriData
     char port[MAXLINE];
 };
 
+typedef struct obj {
+    char uri[MAXLINE];
+    char respHeader[MAXLINE];
+    int hsize;
+    char respBody[MAX_OBJECT_SIZE];
+    int bsize;
+    struct obj* next;
+    struct obj* prev;
+}obj_t;
+
+typedef struct cache {
+    obj_t* head;
+    obj_t* tail;
+    int cacheSize;
+    int nreader;
+    sem_t rlock;
+    sem_t wlock;
+}cache_t;
 
 void doit(int fd);
 void clienterror(int fd, char *cause, char *errnum, 
 		 char *shortmsg, char *longmsg);
 void parseUri(char* uri,struct uriData* u);
 void thread();
-sbuf_t sbuf;
+obj_t* readCache(char* uri);
+void writeCache(obj_t* obj);
+sbuf_t sbuf;//线程池的buf
+cache_t obj_cache;//obj缓存
 int main(int argc ,char** argv)
 {
     int listenfd,connfd;
@@ -36,6 +57,7 @@ int main(int argc ,char** argv)
     }
     listenfd = Open_listenfd(argv[1]);
     sbuf_init(&sbuf,NTHREAD+10);
+    cache_init(&obj_cache);
     for(int i = 0;i < NTHREAD;i++) {
         Pthread_create(&tid,NULL,thread,NULL);
     }
@@ -48,10 +70,22 @@ int main(int argc ,char** argv)
         sbuf_insert(&sbuf,connfd); 
     }
     sbuf_deinit(&sbuf);
+    Free(&obj_cache);
     return 0;
 }
 
-
+void cache_init(cache_t* cache) {
+    cache->cacheSize = 0;
+    cache->head = Malloc(sizeof(obj_t*));
+    cache->tail = Malloc(sizeof(obj_t*));
+    cache->head->next = cache->tail;
+    cache->tail->prev = cache->head;
+    cache->tail->next = NULL;
+    strcpy(cache->tail->uri,"null");
+    cache->nreader = 0;
+    sem_init(&cache->rlock,0,5);
+    sem_init(&cache->wlock,0,1);
+}
 void thread() {
     Pthread_detach(Pthread_self());
     while(1) {
@@ -79,6 +113,14 @@ void doit(int fd) {
         clienterror(fd,method,501,"Not Implement" ,"Don't support this method");
         return;
     }
+    obj_t* obj = readCache(uri);
+    if(obj != NULL) {
+        Rio_writen(fd,obj->respHeader,obj->hsize);
+        Rio_writen(fd,obj->respBody,obj->bsize);
+        return;
+    }
+    obj = Malloc(sizeof(*obj));
+    strcpy(obj->uri,uri); 
     parseUri(uri,&u);
     changeHttpData(&rio,&u,httpData);
     printf("%s %s %s\n",u.host,u.port,u.path);
@@ -89,17 +131,67 @@ void doit(int fd) {
     while((n = Rio_readlineb(&serverRio,buf,MAXLINE)) != 0) {
         Rio_writen(fd,buf,n);
         sendByte += n;
+        strcat(obj->respHeader,buf);
         if(strcmp(buf,"\r\n") == 0) {//resp Header read finish
             break;
         }
     }
+    obj->hsize = sendByte;
     while((n = Rio_readnb(&serverRio,buf,MAXLINE)) != 0) {//读服务器返回的object
         Rio_writen(fd,buf,n);
+        strcat(obj->respBody,buf);
         sendByte += n;
         objByte += n;
     }
+    obj->bsize = objByte;
+    if(objByte > MAX_OBJECT_SIZE) {
+        Free(obj);
+    } else {
+        P(&obj_cache.wlock);
+        writeCache(obj);
+        printf("writeCache ok uri<%s> objsize<%d>\n",obj->uri,obj->bsize);
+        V(&obj_cache.wlock);
+    }
     printf("Send to client <%d> byte\n",sendByte);
     Close(serverfd);
+}
+
+obj_t* readCache(char* uri) {
+    P(&obj_cache.rlock);
+    obj_cache.nreader++;
+    if(obj_cache.nreader == 1) {
+        P(&obj_cache.wlock);
+    }
+    obj_t* node = obj_cache.head->next;
+    while(node != NULL) {
+        printf("uri<%s>\n",node->uri);
+        if(strcmp(node->uri,uri) == 0) {
+            
+            break;
+        }
+        node = node -> next;
+    }
+    obj_cache.nreader--;
+    if(obj_cache.nreader == 0) {
+        V(&obj_cache.wlock);
+    }
+    V(&obj_cache.rlock);
+    return node;
+}
+
+void writeCache(obj_t* obj) {
+    while(obj->bsize + obj_cache.cacheSize > MAX_CACHE_SIZE && obj_cache.head->next != obj_cache.tail) {
+        obj_t* node = obj_cache.tail -> prev;
+        obj_cache.tail -> prev = node->prev;
+        node->prev->next = obj_cache.tail;
+        obj_cache.cacheSize -= node->bsize;
+        Free(node);
+    }
+    obj->next = obj_cache.head->next;
+    obj_cache.head -> next = obj;
+    obj->prev = obj_cache.head;
+    obj->next->prev = obj;
+    obj_cache.cacheSize += obj->bsize;
 }
 
 void parseUri(char* uri,struct uriData* u) {
