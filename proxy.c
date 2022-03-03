@@ -1,9 +1,11 @@
 #include <stdio.h>
 #include"csapp.h"
+#include "threadpool.h"
 
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
+#define NTHREAD 20
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
@@ -20,7 +22,8 @@ void doit(int fd);
 void clienterror(int fd, char *cause, char *errnum, 
 		 char *shortmsg, char *longmsg);
 void parseUri(char* uri,struct uriData* u);
-void thread(void* v);
+void thread();
+sbuf_t sbuf;
 int main(int argc ,char** argv)
 {
     int listenfd,connfd;
@@ -32,22 +35,30 @@ int main(int argc ,char** argv)
         fprintf(stderr,"usage %s <port>\n",argv[0]);
     }
     listenfd = Open_listenfd(argv[1]);
+    sbuf_init(&sbuf,NTHREAD+10);
+    for(int i = 0;i < NTHREAD;i++) {
+        Pthread_create(&tid,NULL,thread,NULL);
+    }
     while(1) {
         clientlen = sizeof(clientaddr);
         connfd = Accept(listenfd, (SA*)&clientaddr, &clientlen);
         Getnameinfo((SA*)&clientaddr,&clientlen,hostname,MAXLINE,
             port,MAXLINE,0);
-        printf("hostnme<%s>,port<%s>\n",hostname,port);
-        Pthread_create(&tid,NULL,thread,(void*)&connfd);
+        printf("hostnme<%s>,port<%s> fd<%d>\n",hostname,port,connfd);
+        sbuf_insert(&sbuf,connfd); 
     }
+    sbuf_deinit(&sbuf);
     return 0;
 }
 
-void thread(void* v) {
-    int fd = *(int*)v;
+
+void thread() {
     Pthread_detach(Pthread_self());
-    doit(fd);
-    Close(fd);
+    while(1) {
+        int fd = sbuf_receive(&sbuf);
+        doit(fd);
+        Close(fd);
+    }
 }
 
 void doit(int fd) {
@@ -57,6 +68,7 @@ void doit(int fd) {
     struct uriData u;
     int serverfd;
     int sendByte = 0;
+    int objByte = 0;
     Rio_readinitb(&rio,fd);
     if(!Rio_readlineb(&rio,buf,MAXLINE)) {
         return;
@@ -74,9 +86,17 @@ void doit(int fd) {
     Rio_readinitb(&serverRio,serverfd);
     Rio_writen(serverfd,httpData,strlen(httpData));
     size_t n;
-    while((n = Rio_readnb(&serverRio,buf,MAXLINE)) != 0) {
+    while((n = Rio_readlineb(&serverRio,buf,MAXLINE)) != 0) {
         Rio_writen(fd,buf,n);
         sendByte += n;
+        if(strcmp(buf,"\r\n") == 0) {//resp Header read finish
+            break;
+        }
+    }
+    while((n = Rio_readnb(&serverRio,buf,MAXLINE)) != 0) {//读服务器返回的object
+        Rio_writen(fd,buf,n);
+        sendByte += n;
+        objByte += n;
     }
     printf("Send to client <%d> byte\n",sendByte);
     Close(serverfd);
